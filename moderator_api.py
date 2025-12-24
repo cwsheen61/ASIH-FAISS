@@ -21,7 +21,8 @@ import faiss
 import pickle
 
 # Local imports
-from text_fingerprint import hash_text, get_text_encoder
+from text_fingerprint import hash_text, get_text_encoder, generate_text_fingerprint
+from database import Database
 import config
 
 # Initialize FastAPI
@@ -64,6 +65,8 @@ class ModeratorService:
         self.image_index = None
         self.image_metadata = None
         self.loaded = False
+        self.db = Database()
+        self.ollama_available = self._check_ollama()
 
     def load(self):
         """Load FAISS indices and models (one-time setup)."""
@@ -110,6 +113,149 @@ class ModeratorService:
         print(f"✓ Models loaded in {elapsed:.1f}s\n")
         self.loaded = True
 
+    def _check_ollama(self) -> bool:
+        """Check if Ollama is available for fallback moderation."""
+        try:
+            import requests
+            response = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=2)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def _mark_indices_dirty(self):
+        """Mark indices as needing rebuild."""
+        dirty_file = config.DATA_DIR / ".indices_dirty"
+        dirty_file.touch()
+
+    def _fallback_moderate_text(self, text: str) -> tuple[str, str]:
+        """
+        Fallback text moderation using Ollama when FAISS doesn't have a match.
+
+        Returns:
+            (verdict, reason) tuple - ("ALLOWED" or "DENIED", reason string)
+        """
+        if not self.ollama_available:
+            return ("ALLOWED", "Novel content (no fallback moderation available)")
+
+        try:
+            import requests
+
+            prompt = f"""Analyze this text for hate speech, bigotry, or policy violations.
+
+Text: "{text}"
+
+Respond in JSON format:
+{{"classification": "ALLOWED" or "DENIED", "reason": "brief explanation"}}"""
+
+            response = requests.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": config.OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json"
+                },
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                response_text = result.get('response', '{}')
+
+                try:
+                    parsed = json.loads(response_text)
+                    classification = parsed.get('classification', 'ALLOWED').upper()
+                    reason = parsed.get('reason', 'Content moderated by Ollama')
+
+                    if classification in ['ALLOWED', 'DENIED']:
+                        return (classification, reason)
+                except json.JSONDecodeError:
+                    pass
+
+        except Exception as e:
+            print(f"Ollama fallback error: {e}")
+
+        # Default to ALLOWED if moderation fails
+        return ("ALLOWED", "Novel content (moderation failed)")
+
+    def _save_text_to_db(self, text: str, text_hash: str, text_embedding_json: str, verdict: str, reason: str):
+        """Save moderated text content to database for future lookups."""
+        try:
+            import sqlite3
+            from datetime import datetime
+
+            # Do everything in one transaction
+            with sqlite3.connect(self.db.db_path) as conn:
+                # Insert post
+                cursor = conn.execute("""
+                    INSERT OR IGNORE INTO posts
+                    (source, post_id, thread_id, content_text, post_type, quarantined,
+                     text_hash, text_embedding, scraped_at, gemini_label, gemini_reason, first_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, ("gocial/production", f"gocial_{text_hash[:16]}", "0", text[:1000], 'text',
+                      False, text_hash, text_embedding_json, datetime.now(), verdict, reason))
+
+                db_id = cursor.lastrowid
+                conn.commit()
+
+            # Mark indices as needing rebuild
+            self._mark_indices_dirty()
+
+            print(f"✓ Saved novel text content to DB: {verdict} (id={db_id})")
+
+        except Exception as e:
+            print(f"Error saving text to DB: {e}")
+
+    def _record_cache_hit(self, db_id: int):
+        """Record that a fingerprint was matched (cache hit)."""
+        try:
+            import sqlite3
+            with sqlite3.connect(self.db.db_path) as conn:
+                conn.execute(
+                    "UPDATE posts SET last_hit_at = CURRENT_TIMESTAMP, hit_count = hit_count + 1 WHERE id = ?",
+                    (db_id,)
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"Error recording cache hit: {e}")
+
+    def _save_image_to_db(self, image_bytes: bytes, phash: str, clip_embedding: str, verdict: str, reason: str):
+        """Save moderated image content to database for future lookups."""
+        try:
+            import sqlite3
+            from datetime import datetime
+
+            # Encode and save image
+            encoded_filename = f"gocial_{phash}.jpg.b64"
+            encoded_path = config.ENCODED_DIR / encoded_filename
+
+            encoded_data = base64.b64encode(image_bytes)
+            with open(encoded_path, 'wb') as f:
+                f.write(encoded_data)
+
+            # Do everything in one transaction
+            with sqlite3.connect(self.db.db_path) as conn:
+                cursor = conn.execute("""
+                    INSERT OR IGNORE INTO posts
+                    (source, post_id, thread_id, content_text, post_type, quarantined,
+                     has_image, image_filename, encoded_path, image_phash, clip_embedding,
+                     scraped_at, gemini_label, gemini_reason, first_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, ("gocial/production", f"gocial_{phash}", "0", "", 'image', False,
+                      True, encoded_filename, str(encoded_path), phash, clip_embedding,
+                      datetime.now(), verdict, reason))
+
+                db_id = cursor.lastrowid
+                conn.commit()
+
+            # Mark indices as needing rebuild
+            self._mark_indices_dirty()
+
+            print(f"✓ Saved novel image content to DB: {verdict} (id={db_id})")
+
+        except Exception as e:
+            print(f"Error saving image to DB: {e}")
+
     def check_text(self, text: str, threshold: float = 0.85) -> ModerationResult:
         """
         Check text against fingerprint database.
@@ -152,6 +298,9 @@ class ModeratorService:
                 idx = indices[0][0]
                 meta = self.text_metadata[idx]
 
+                # Record cache hit
+                self._record_cache_hit(meta['id'])
+
                 lookup_time = (time.time() - start) * 1000
 
                 return ModerationResult(
@@ -164,14 +313,23 @@ class ModeratorService:
         except Exception as e:
             print(f"Error in text check: {e}")
 
+        # No match - content is novel, use fallback moderation
+        # Generate fingerprint for saving (no OCR text for pure text content)
+        text_hash, text_embedding_json = generate_text_fingerprint(text, "")
+
+        # Call Ollama for moderation
+        verdict, reason = self._fallback_moderate_text(text)
+
+        # Save to database for future lookups
+        self._save_text_to_db(text, text_hash, text_embedding_json, verdict, reason)
+
         lookup_time = (time.time() - start) * 1000
 
-        # No match - content is novel
         return ModerationResult(
-            status="ALLOWED",  # Default to allowed for novel content
-            confidence=0.0,
-            match_type=None,
-            reason="Novel content (not in database)",
+            status=verdict,
+            confidence=1.0 if verdict == "DENIED" else 0.0,
+            match_type=None,  # Novel content
+            reason=reason,
             lookup_time_ms=lookup_time
         )
 
@@ -215,6 +373,9 @@ class ModeratorService:
                     idx = indices[0][0]
                     meta = self.image_metadata[idx]
 
+                    # Record cache hit
+                    self._record_cache_hit(meta['id'])
+
                     lookup_time = (time.time() - start) * 1000
 
                     return ModerationResult(
@@ -227,14 +388,34 @@ class ModeratorService:
         except Exception as e:
             print(f"Error in image check: {e}")
 
+        # No match - content is novel
+        # For images, default to ALLOWED but save to database for future training
+        # (Gemini fallback would be expensive - handle in batch labeling instead)
+
+        try:
+            from PIL import Image
+            import imagehash
+            from io import BytesIO
+
+            # Generate pHash
+            img = Image.open(BytesIO(image_bytes))
+            phash = str(imagehash.phash(img))
+
+            # We already have CLIP embedding from above
+            if clip_emb:
+                # Save novel image to database with ALLOWED verdict
+                # It will be labeled properly in next batch labeling run
+                self._save_image_to_db(image_bytes, phash, clip_emb, "ALLOWED", "Novel content (needs manual review)")
+        except Exception as e:
+            print(f"Error saving novel image: {e}")
+
         lookup_time = (time.time() - start) * 1000
 
-        # No match - content is novel
         return ModerationResult(
-            status="ALLOWED",
+            status="ALLOWED",  # Fail open for novel images
             confidence=0.0,
             match_type=None,
-            reason="Novel content (not in database)",
+            reason="Novel content (saved for review)",
             lookup_time_ms=lookup_time
         )
 
